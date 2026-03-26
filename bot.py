@@ -1,5 +1,6 @@
 import os
 import base64
+from datetime import datetime, timezone, timedelta
 import telebot
 from dotenv import load_dotenv
 from vision import analyze_image
@@ -17,80 +18,155 @@ if not TELEGRAM_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 
+# ─── Rate Limiting (in-memory) ────────────────────────────────────
+#
+# Временное решение до подключения Supabase (Этап 6).
+# Данные хранятся в оперативной памяти — при перезапуске бота
+# (каждый деплой) счётчики сбрасываются. Для бета-теста — достаточно.
+#
+# Структура: {user_id: {"date": "2026-03-26", "count": 3}}
+# "date" — дата последнего скана (для сброса в полночь)
+# "count" — количество сканов за сегодня
+
+DAILY_LIMIT = 5  # Максимум сканов в день на пользователя
+scan_counter = {}  # Словарь-счётчик (живёт в оперативной памяти)
+
+# Часовой пояс Москвы (UTC+3) — для сброса в полночь по московскому времени
+MSK = timezone(timedelta(hours=3))
+
+
+def check_rate_limit(user_id: int) -> dict:
+    """
+    Проверяет, не исчерпал ли пользователь дневной лимит.
+
+    Возвращает:
+        {"allowed": True, "remaining": 4}  — можно сканировать
+        {"allowed": False, "remaining": 0} — лимит исчерпан
+    """
+    today = datetime.now(MSK).strftime("%Y-%m-%d")
+
+    if user_id not in scan_counter:
+        # Первый скан — создаём запись
+        scan_counter[user_id] = {"date": today, "count": 0}
+
+    user_data = scan_counter[user_id]
+
+    # Если дата изменилась — наступил новый день, сбрасываем счётчик
+    if user_data["date"] != today:
+        user_data["date"] = today
+        user_data["count"] = 0
+
+    remaining = DAILY_LIMIT - user_data["count"]
+
+    if user_data["count"] >= DAILY_LIMIT:
+        return {"allowed": False, "remaining": 0}
+
+    return {"allowed": True, "remaining": remaining}
+
+
+def increment_scan(user_id: int):
+    """Увеличивает счётчик сканов для пользователя."""
+    today = datetime.now(MSK).strftime("%Y-%m-%d")
+
+    if user_id not in scan_counter:
+        scan_counter[user_id] = {"date": today, "count": 0}
+
+    scan_counter[user_id]["count"] += 1
+
+
+# ─── Обработка изображения ────────────────────────────────────────
+
 def process_image(message, file_id: str):
     """
     Общая функция обработки изображения — и для фото, и для документов.
 
     Пайплайн:
-    1. Отправляем индикатор загрузки (чтобы пользователь не думал, что бот завис)
-    2. Скачиваем файл из Telegram по file_id
-    3. Кодируем в base64 (текстовый формат, понятный Vision API)
-    4. Отправляем в Vision LLM через vision.py
-    5. Возвращаем результат пользователю
+    1. Проверяем rate limit
+    2. Отправляем индикатор загрузки
+    3. Скачиваем файл из Telegram по file_id
+    4. Кодируем в base64
+    5. Отправляем в Vision LLM через vision.py
+    6. Возвращаем результат пользователю
+    7. Увеличиваем счётчик сканов
     """
 
-    # Шаг 1: Индикатор загрузки — критически важен для UX
-    # Без него пользователь 10–15 секунд смотрит в пустоту
+    user_id = message.from_user.id
+
+    # Шаг 1: Проверяем rate limit
+    limit_check = check_rate_limit(user_id)
+    if not limit_check["allowed"]:
+        bot.reply_to(
+            message,
+            f"На сегодня лимит исчерпан ({DAILY_LIMIT} из {DAILY_LIMIT}). "
+            f"Завтра счётчик сбросится."
+        )
+        return
+
+    # Шаг 2: Индикатор загрузки
     loading_msg = bot.reply_to(message, "⏳ Анализирую состав...")
 
     try:
-        # Шаг 2: Скачиваем файл из Telegram
-        # file_id — это «номерок в гардеробе», по нему получаем информацию о файле
+        # Шаг 3: Скачиваем файл из Telegram
         file_info = bot.get_file(file_id)
-
-        # download_file() скачивает содержимое файла как массив байтов
         file_bytes = bot.download_file(file_info.file_path)
 
-        # Шаг 3: Кодируем в base64
-        # base64 превращает бинарные данные (фото) в текстовую строку
-        # Это нужно, потому что JSON (формат API-запроса) не умеет хранить бинарные данные
+        # Шаг 4: Кодируем в base64
         image_base64 = base64.b64encode(file_bytes).decode("utf-8")
 
         # Определяем MIME-тип по расширению файла
-        # MIME-тип — это «этикетка» файла: image/jpeg, image/png и т.д.
         file_path = file_info.file_path.lower()
         if file_path.endswith(".png"):
             mime_type = "image/png"
         elif file_path.endswith(".webp"):
             mime_type = "image/webp"
         else:
-            mime_type = "image/jpeg"  # По умолчанию — JPEG (самый частый)
+            mime_type = "image/jpeg"
 
-        # Шаг 4: Отправляем в Vision LLM
+        # Шаг 5: Отправляем в Vision LLM
         result = analyze_image(image_base64, mime_type)
 
-        # Шаг 5: Обрабатываем результат
+        # Шаг 6: Обрабатываем результат
         if result["success"]:
-            # Удаляем сообщение «Анализирую...» — оно больше не нужно
+            # Увеличиваем счётчик ТОЛЬКО при успешном анализе
+            # (неудачные попытки не должны «сжигать» лимит)
+            increment_scan(user_id)
+
+            # Считаем, сколько осталось
+            remaining = DAILY_LIMIT - scan_counter[user_id]["count"]
+
+            # Удаляем «Анализирую...»
             bot.delete_message(message.chat.id, loading_msg.message_id)
 
-            # Отправляем анализ
-            # Если текст длиннее 4096 символов (лимит Telegram), обрезаем
+            # Формируем ответ
             response_text = result["text"]
+
+            # Добавляем счётчик оставшихся сканов
+            response_text += f"\n\n📊 Осталось сканов сегодня: {remaining} из {DAILY_LIMIT}"
+
+            # Лимит Telegram — 4096 символов
             if len(response_text) > 4096:
                 response_text = response_text[:4090] + "\n(...)"
 
             bot.send_message(message.chat.id, response_text)
 
-            # Логируем метрики в консоль (позже — в Supabase)
+            # Логируем метрики
             usage = result.get("usage", {})
             print(
-                f"✅ Скан: модель={result.get('model', '?')}, "
+                f"✅ Скан: user={user_id}, модель={result.get('model', '?')}, "
                 f"время={result.get('elapsed_seconds', '?')}с, "
                 f"токены_вход={usage.get('input_tokens', 0)}, "
-                f"токены_выход={usage.get('output_tokens', 0)}"
+                f"токены_выход={usage.get('output_tokens', 0)}, "
+                f"осталось={remaining}/{DAILY_LIMIT}"
             )
         else:
-            # Если API вернул ошибку — сообщаем пользователю
             bot.edit_message_text(
-                f"Не удалось проанализировать фото. Попробуйте ещё раз через минуту.",
+                "Не удалось проанализировать фото. Попробуйте ещё раз через минуту.",
                 chat_id=message.chat.id,
                 message_id=loading_msg.message_id
             )
             print(f"❌ Ошибка Vision API: {result['error']}")
 
     except Exception as e:
-        # Ловим любую непредвиденную ошибку — бот не должен «молча умереть»
         bot.edit_message_text(
             "Что-то пошло не так. Попробуйте ещё раз.",
             chat_id=message.chat.id,
@@ -115,6 +191,8 @@ def handle_start(message):
         "\n"
         "Мы не храним ваши фото и не используем их для обучения моделей.\n"
         "\n"
+        f"Лимит: {DAILY_LIMIT} сканов в день.\n"
+        "\n"
         "Просто пришлите фото — начнём."
     )
     bot.reply_to(message, welcome_text)
@@ -130,6 +208,7 @@ def handle_help(message):
         "/start — начало работы\n"
         "/help — эта справка\n"
         "\n"
+        f"Лимит: {DAILY_LIMIT} сканов в день.\n"
         "Совет: отправляйте фото как файл (📎) для лучшего качества."
     )
     bot.reply_to(message, help_text)
@@ -141,8 +220,7 @@ def handle_help(message):
 def handle_photo(message):
     """
     Обработчик фото (сжатых Telegram).
-    Telegram присылает массив photo — несколько версий разного размера.
-    Берём последнюю ([-1]) — она самая большая и качественная.
+    Берём последний элемент массива photo — самый качественный.
     """
     file_id = message.photo[-1].file_id
     process_image(message, file_id)
@@ -150,10 +228,7 @@ def handle_photo(message):
 
 @bot.message_handler(content_types=["document"])
 def handle_document(message):
-    """
-    Обработчик документов (файлов, отправленных через «скрепку»).
-    Файлы приходят в оригинальном качестве — без сжатия Telegram.
-    """
+    """Обработчик документов (файлов через «скрепку»)."""
     mime = message.document.mime_type or ""
     if mime.startswith("image/"):
         file_id = message.document.file_id
@@ -176,10 +251,10 @@ def handle_sticker(message):
 
 @bot.message_handler(func=lambda message: True)
 def handle_other(message):
-    """Обработчик всех остальных сообщений (текст и прочее)."""
+    """Обработчик всех остальных сообщений."""
     bot.reply_to(message, "Пришлите фото состава продукта — я разберу его для вас.")
 
 
 if __name__ == "__main__":
-    print("Бот запущен...")
+    print(f"Бот запущен. Лимит: {DAILY_LIMIT} сканов/день на пользователя.")
     bot.infinity_polling()

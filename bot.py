@@ -22,36 +22,27 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 #
 # Временное решение до подключения Supabase (Этап 6).
 # Данные хранятся в оперативной памяти — при перезапуске бота
-# (каждый деплой) счётчики сбрасываются. Для бета-теста — достаточно.
+# (каждый деплой) счётчики сбрасываются.
 #
-# Структура: {user_id: {"date": "2026-03-26", "count": 3}}
-# "date" — дата последнего скана (для сброса в полночь)
-# "count" — количество сканов за сегодня
+# DAILY_LIMIT = 50 — тестовый режим (для бета-теста)
+# Вернуть на 5 перед публичным запуском.
 
-DAILY_LIMIT = 5  # Максимум сканов в день на пользователя
-scan_counter = {}  # Словарь-счётчик (живёт в оперативной памяти)
+DAILY_LIMIT = 50  # ← ТЕСТОВЫЙ РЕЖИМ. Продакшен: 5
+scan_counter = {}
 
-# Часовой пояс Москвы (UTC+3) — для сброса в полночь по московскому времени
+# Часовой пояс Москвы (UTC+3)
 MSK = timezone(timedelta(hours=3))
 
 
 def check_rate_limit(user_id: int) -> dict:
-    """
-    Проверяет, не исчерпал ли пользователь дневной лимит.
-
-    Возвращает:
-        {"allowed": True, "remaining": 4}  — можно сканировать
-        {"allowed": False, "remaining": 0} — лимит исчерпан
-    """
+    """Проверяет дневной лимит пользователя."""
     today = datetime.now(MSK).strftime("%Y-%m-%d")
 
     if user_id not in scan_counter:
-        # Первый скан — создаём запись
         scan_counter[user_id] = {"date": today, "count": 0}
 
     user_data = scan_counter[user_id]
 
-    # Если дата изменилась — наступил новый день, сбрасываем счётчик
     if user_data["date"] != today:
         user_data["date"] = today
         user_data["count"] = 0
@@ -127,11 +118,7 @@ def process_image(message, file_id: str):
 
         # Шаг 6: Обрабатываем результат
         if result["success"]:
-            # Увеличиваем счётчик ТОЛЬКО при успешном анализе
-            # (неудачные попытки не должны «сжигать» лимит)
             increment_scan(user_id)
-
-            # Считаем, сколько осталось
             remaining = DAILY_LIMIT - scan_counter[user_id]["count"]
 
             # Удаляем «Анализирую...»
@@ -139,9 +126,6 @@ def process_image(message, file_id: str):
 
             # Формируем ответ
             response_text = result["text"]
-
-            # Добавляем счётчик оставшихся сканов
-            response_text += f"\n\n📊 Осталось сканов сегодня: {remaining} из {DAILY_LIMIT}"
 
             # Лимит Telegram — 4096 символов
             if len(response_text) > 4096:
@@ -191,8 +175,6 @@ def handle_start(message):
         "\n"
         "Мы не храним ваши фото и не используем их для обучения моделей.\n"
         "\n"
-        f"Лимит: {DAILY_LIMIT} сканов в день.\n"
-        "\n"
         "Просто пришлите фото — начнём."
     )
     bot.reply_to(message, welcome_text)
@@ -208,7 +190,6 @@ def handle_help(message):
         "/start — начало работы\n"
         "/help — эта справка\n"
         "\n"
-        f"Лимит: {DAILY_LIMIT} сканов в день.\n"
         "Совет: отправляйте фото как файл (📎) для лучшего качества."
     )
     bot.reply_to(message, help_text)
@@ -256,5 +237,5 @@ def handle_other(message):
 
 
 if __name__ == "__main__":
-    print(f"Бот запущен. Лимит: {DAILY_LIMIT} сканов/день на пользователя.")
+    print(f"Бот запущен. Лимит: {DAILY_LIMIT} сканов/день (ТЕСТОВЫЙ РЕЖИМ).")
     bot.infinity_polling()
